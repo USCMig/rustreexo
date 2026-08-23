@@ -133,7 +133,22 @@ impl<Hash: AccumulatorHash> Node<Hash> {
             ancestor: Option<Rc<Node<Hash>>>,
             reader: &mut R,
             index: &mut HashMap<Hash, Weak<Node<Hash>>>,
+            depth: u8,
         ) -> io::Result<Rc<Node<Hash>>> {
+            // This function recurses once per branch node, so without a bound the
+            // *input* chooses the recursion depth and a few megabytes of crafted
+            // bytes overflow the stack. That aborts the process: it is not an
+            // unwind, so a caller cannot contain it with `catch_unwind`.
+            //
+            // A root is a perfect tree of at most `MAX_FOREST_ROWS` rows, so its
+            // leaves sit at most that many levels below it. Anything deeper is not
+            // a forest this crate could ever have serialized.
+            if depth > MAX_FOREST_ROWS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MemForest node nested deeper than a root can be tall",
+                ));
+            }
             let mut ty = [0u8; 8];
             reader.read_exact(&mut ty)?;
             let data = Hash::read(reader)?;
@@ -141,7 +156,12 @@ impl<Hash: AccumulatorHash> Node<Hash> {
             let ty = match u64::from_le_bytes(ty) {
                 0 => NodeType::Branch,
                 1 => NodeType::Leaf,
-                _ => panic!("Invalid node type"),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected node type for MemForest node",
+                    ))
+                }
             };
             if ty == NodeType::Leaf {
                 let leaf = Rc::new(Node {
@@ -162,8 +182,8 @@ impl<Hash: AccumulatorHash> Node<Hash> {
                 right: RefCell::new(None),
             });
             if !data.is_empty() {
-                let left = _read_one(Some(node.clone()), reader, index)?;
-                let right = _read_one(Some(node.clone()), reader, index)?;
+                let left = _read_one(Some(node.clone()), reader, index, depth + 1)?;
+                let right = _read_one(Some(node.clone()), reader, index, depth + 1)?;
                 node.left.replace(Some(left));
                 node.right.replace(Some(right));
             }
@@ -179,7 +199,7 @@ impl<Hash: AccumulatorHash> Node<Hash> {
             Ok(node)
         }
         let mut index = HashMap::with_hasher(Default::default());
-        let root = _read_one(None, reader, &mut index)?;
+        let root = _read_one(None, reader, &mut index, 0)?;
         Ok((root, index))
     }
 
@@ -1095,5 +1115,76 @@ mod test {
         assert_eq!(deserialized.get_roots().len(), 1);
         assert!(deserialized.get_roots()[0].get_data().is_empty());
         assert_eq!(deserialized.leaves, 16);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_invalid_node_type() {
+        // A node's type tag is a u64 that may only be 0 (branch) or 1 (leaf).
+        // Anything else used to `panic!`, which makes `deserialize` unusable on
+        // untrusted bytes: the caller gets an unwind instead of the `io::Result`
+        // the signature promises. Found by fuzzing a serialized forest.
+        let serialized = [
+            0x0a, 0x00, 0x00, 0x7e, 0x7e, 0x00, 0x00, 0x00, // leaves
+            0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // number of roots
+            0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // node type: neither 0 nor 1
+            0x00,
+        ];
+        let err = MemForest::<BitcoinNodeHash>::deserialize(&serialized[..])
+            .expect_err("an out-of-range node type is not a valid forest");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_unbounded_nesting() {
+        // `_read_one` recurses per branch node. Before the depth bound the input
+        // chose how deep to go, so a few megabytes of nested branches overflowed
+        // the stack and aborted the process -- not an unwind, so uncatchable.
+        //
+        // Build a left spine `depth` branches deep and check where the reader
+        // stops descending: `MAX_FOREST_ROWS` levels below the root is the
+        // tallest a real root can be, so 63 is fine and 64 is not.
+        fn spine(depth: usize) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&1u64.to_le_bytes()); // leaves
+            v.extend_from_slice(&1u64.to_le_bytes()); // one root
+            for _ in 0..depth {
+                v.extend_from_slice(&0u64.to_le_bytes()); // branch
+                v.push(2); // a non-empty hash, so the reader descends
+                v.extend_from_slice(&[7u8; 32]);
+            }
+            for _ in 0..(2 * depth + 2) {
+                v.extend_from_slice(&1u64.to_le_bytes()); // leaf
+                v.push(2);
+                v.extend_from_slice(&[9u8; 32]);
+            }
+            v
+        }
+
+        MemForest::<BitcoinNodeHash>::deserialize(&*spine(MAX_FOREST_ROWS as usize))
+            .expect("a root as tall as a root may be is still a valid root");
+
+        for depth in [MAX_FOREST_ROWS as usize + 1, 100, 10_000] {
+            let Err(err) = MemForest::<BitcoinNodeHash>::deserialize(&*spine(depth)) else {
+                panic!("nesting {} deep should be rejected, not accepted", depth);
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "depth {}", depth);
+        }
+    }
+
+    #[test]
+    fn test_deserialize_rejects_every_out_of_range_node_type() {
+        // The tag is read as a u64, so the invalid space is everything but 0 and
+        // 1. Sweep the boundaries rather than trusting the one fuzzer seed.
+        for ty in [2u64, 3, 255, 256, u32::MAX as u64, u64::MAX] {
+            let mut serialized = Vec::new();
+            serialized.extend_from_slice(&1u64.to_le_bytes()); // leaves
+            serialized.extend_from_slice(&1u64.to_le_bytes()); // one root
+            serialized.extend_from_slice(&ty.to_le_bytes()); // the bad tag
+            serialized.extend_from_slice(&[0u8; 33]); // enough bytes for a hash
+            let Err(err) = MemForest::<BitcoinNodeHash>::deserialize(&*serialized) else {
+                panic!("node type {} should be rejected, not accepted", ty);
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "node type {}", ty);
+        }
     }
 }
