@@ -280,7 +280,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         writer.write_all(&(self.roots.len() as u64).to_le_bytes())?;
 
         for root in &self.roots {
-            root.write_one(&mut writer).unwrap();
+            root.write_one(&mut writer)?;
         }
 
         Ok(())
@@ -1132,6 +1132,43 @@ mod test {
         let err = MemForest::<BitcoinNodeHash>::deserialize(&serialized[..])
             .expect_err("an out-of-range node type is not a valid forest");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_serialize_reports_writer_errors() {
+        // `serialize` returns `io::Result`, so a writer that fails partway --
+        // a full disk, a closed pipe -- has to come back as `Err`. The root
+        // loop used to `unwrap()` it and panic instead.
+        struct ShortWriter(usize);
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "no room left"));
+                }
+                let n = buf.len().min(self.0);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let hashes: Vec<BitcoinNodeHash> =
+            (0..4_u8).map(|i| BitcoinNodeHash::from([i; 32])).collect();
+        let mut p = MemForest::<BitcoinNodeHash>::new();
+        p.modify(&hashes, &[]).expect("modify should work");
+
+        // Room for the two length prefixes but not for the roots that follow.
+        let err = p
+            .serialize(ShortWriter(16))
+            .expect_err("a writer that runs out of room is an error, not a panic");
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+
+        // The same forest still serializes when the writer accepts everything.
+        let mut good = Vec::new();
+        p.serialize(&mut good).expect("serialize should work");
+        assert!(!good.is_empty());
     }
 
     #[test]
